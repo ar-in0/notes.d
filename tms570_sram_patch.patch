@@ -1,0 +1,68 @@
+diff --git a/bsps/arm/tms570/start/bspstarthooks-hwinit.c b/bsps/arm/tms570/start/bspstarthooks-hwinit.c
+index 6407cc4a45..e07edb266b 100644
+--- a/bsps/arm/tms570/start/bspstarthooks-hwinit.c
++++ b/bsps/arm/tms570/start/bspstarthooks-hwinit.c
+@@ -59,8 +59,8 @@ __attribute__((__naked__)) void bsp_start_hook_0( void )
+     "ldr r0, =#" RTEMS_XSTRING( TMS570_MEMORY_SRAM_ORIGIN ) "\n"
+     "ldr r1, =#" RTEMS_XSTRING( TMS570_MEMORY_SRAM_SIZE ) "\n"
+     "sub r0, lr, r0\n"
+-    "cmp r1, r0\n"
+-    "blt 1f\n"
++    "cmp r0, r1\n"
++    "blo 1f\n"
+ 
+     /*
+      * Initialize the SRAM if we are not running in SRAM.  While we are called,
+diff --git a/bsps/arm/tms570/start/tms570_selftest.c b/bsps/arm/tms570/start/tms570_selftest.c
+index f491efd88d..d25330dba0 100644
+--- a/bsps/arm/tms570/start/tms570_selftest.c
++++ b/bsps/arm/tms570/start/tms570_selftest.c
+@@ -90,6 +90,7 @@ static void tms570_pbist_reset_delay( void )
+ bool tms570_efc_stuck_zero( void )
+ {
+   uint32_t esm_estatus4, esm_estatus1;
++  uint32_t saved_iesr1, saved_iesr4;
+ 
+   bool result = false;
+ 
+@@ -103,6 +104,21 @@ bool tms570_efc_stuck_zero( void )
+                           TMS570_EFUSE_EFCBOUND_EFC_Autoload_Error |
+                           TMS570_EFUSE_EFCBOUND_EFC_Self_Test_Error;
+ 
++
++  /*
++  ** ESM interrupts go to FIQ which cannot be disabled after enable
++  ** at boot. See https://www.ti.com/lit/an/spna218/spna218.pdf,
++  ** https://www.ti.com/lit/ug/spnu563a/spnu563a.pdf
++  ** We disable interrupts at the ESM source itself, so
++  ** FIQ is not involved.
++   */
++  saved_iesr1 = TMS570_ESM.IESR1;
++  saved_iesr4 = TMS570_ESM.IESR4;
++  TMS570_ESM.IECR1 = 0xFFFFFFFFU;
++  TMS570_ESM.IECR4 = 0xFFFFFFFFU;
++
++
++
+   /* configure the output enable for auto load error , instruction info,
+        instruction error, and self test error using boundary register
+        and drive values one across all the errors */
+@@ -133,7 +149,17 @@ bool tms570_efc_stuck_zero( void )
+   TMS570_ESM.SR[ 2U ] = 0x2U;
+ 
+   /* The nERROR pin will become inactive once the LTC counter expires */
+-  TMS570_ESM.EKR = 0x5U;
++  /* TMS570_ESM.EKR = 0x5U; */
++
++   /* Per TMS570LC43x Errate DEVICE#60, we need */
++   /* this workaround to clear error pin after system */
++   /* reset. */
++  TMS570_ESM.EKR = 0x0000000AU;
++  TMS570_ESM.EKR = 0x00000000U;
++
++  /* restore ESM interrupt enables */
++  TMS570_ESM.IESR1 = saved_iesr1;
++  TMS570_ESM.IESR4 = saved_iesr4;
+ 
+   return result;
+ }
