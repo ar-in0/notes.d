@@ -1,0 +1,326 @@
+From 86880dea46cc633adcf5104b7d745c1c4bdc2b36 Mon Sep 17 00:00:00 2001
+From: Armaan Chowfin <ar-in06@proton.me>
+Date: Wed, 15 Apr 2026 17:20:19 +0530
+Subject: [PATCH] rwmutex base with test
+
+---
+ include/rwmutex.h     |  22 ++++++++
+ kernel/core.mk        |   1 +
+ kernel/rwmutex.c      | 120 ++++++++++++++++++++++++++++++++++++++++++
+ tests/rwmutex_tests.c | 115 ++++++++++++++++++++++++++++++++++++++++
+ tests/tests.mk        |   2 +
+ 5 files changed, 260 insertions(+)
+ create mode 100644 include/rwmutex.h
+ create mode 100644 kernel/rwmutex.c
+ create mode 100644 tests/rwmutex_tests.c
+
+diff --git a/include/rwmutex.h b/include/rwmutex.h
+new file mode 100644
+index 0000000..0cf73b9
+--- /dev/null
++++ b/include/rwmutex.h
+@@ -0,0 +1,22 @@
++#pragma once
++
++#include <spin_lock.h>
++#include <types.h>
++#include <waitqueue.h>
++
++/* rwmutex: many readers OR one writer. can block,
++ * callable in kthread context only. */
++typedef struct rwmutex {
++    spin_lock_t lock;
++    u8 live_readers;
++    u8 live_writers;
++    u8 waiting_readers;
++    wait_queue_t readers_q;
++    wait_queue_t writers_q;
++} rwmutex_t;
++
++void rwmutex_init(rwmutex_t *rw);
++void rwmutex_read_acquire(rwmutex_t *rw);
++void rwmutex_read_release(rwmutex_t *rw);
++void rwmutex_write_acquire(rwmutex_t *rw);
++void rwmutex_write_release(rwmutex_t *rw);
+diff --git a/kernel/core.mk b/kernel/core.mk
+index 43c9735..33048c5 100644
+--- a/kernel/core.mk
++++ b/kernel/core.mk
+@@ -14,6 +14,7 @@ CORE_KERNEL_OBJS += spin_lock.o
+ CORE_KERNEL_OBJS += waitqueue.o
+ CORE_KERNEL_OBJS += sched.o
+ CORE_KERNEL_OBJS += mutex.o
++CORE_KERNEL_OBJS += rwmutex.o
+ CORE_KERNEL_OBJS += atomic.o
+ CORE_KERNEL_OBJS += time.o
+ $(call add_src, $(CONFIG_KTEST), CORE_KERNEL_OBJS, ktest.o)
+diff --git a/kernel/rwmutex.c b/kernel/rwmutex.c
+new file mode 100644
+index 0000000..1b1fcd6
+--- /dev/null
++++ b/kernel/rwmutex.c
+@@ -0,0 +1,120 @@
++
++#include <arch_macros.h>
++#include <kthread.h>
++#include <panic.h>
++#include <preempt.h>
++#include <rwmutex.h>
++#include <sched.h>
++#include <spin_lock.h>
++#include <waitqueue.h>
++
++void rwmutex_init(rwmutex_t *rw) {
++    SPIN_LOCK_INIT(&rw->lock);
++    rw->live_readers = 0;
++    rw->live_writers = 0;
++    rw->waiting_readers = 0;
++    wait_queue_init(&rw->readers_q);
++    wait_queue_init(&rw->writers_q);
++}
++
++void rwmutex_read_acquire(rwmutex_t *rw) {
++    kthread_t *cur = get_current_kthread();
++    wait_queue_entry_t entry = WAIT_QUEUE_ENTRY_INIT_VALUE(cur);
++    size_t flags;
++    bool was_waiting = false;
++
++    for (;;) {
++        spin_lock_irqsave(&rw->lock, flags);
++
++        /* if returning from a sleep, drop wait count first */
++        if (was_waiting) {
++            rw->waiting_readers--;
++            was_waiting = false;
++        }
++
++        if (rw->live_writers == 0) {
++            /* no writer -> grab it */
++            if (rw->live_readers == 0xff)
++                panic("rwmutex: too many readers\n");
++            rw->live_readers++;
++            spin_unlock_irqrestore(&rw->lock, flags);
++            smp_mb();
++            return;
++        }
++
++        /* writer is in, park on the reader queue.
++         * enqueue while still holding rw->lock so a racing
++         * writer_release can't miss this thread. */
++        rw->waiting_readers++;
++        was_waiting = true;
++        preempt_disable();
++        add_to_wait_queue(&rw->readers_q, &entry);
++        spin_unlock_irqrestore(&rw->lock, flags);
++
++        schedule();
++        preempt_enable();
++        /* woken -> loop and retry */
++    }
++}
++
++void rwmutex_read_release(rwmutex_t *rw) {
++    size_t flags;
++    bool last;
++
++    smp_mb();
++    spin_lock_irqsave(&rw->lock, flags);
++    if (rw->live_readers == 0)
++        panic("rwmutex: read_release underflow\n");
++    rw->live_readers--;
++    last = (rw->live_readers == 0);
++    spin_unlock_irqrestore(&rw->lock, flags);
++
++    /* only waking a writer if this thread was the last reader out.
++     * (wake_one on an empty queue is a no-op anyway) */
++    if (last)
++        wait_queue_wake_one(&rw->writers_q);
++}
++
++void rwmutex_write_acquire(rwmutex_t *rw) {
++    kthread_t *cur = get_current_kthread();
++    wait_queue_entry_t entry = WAIT_QUEUE_ENTRY_INIT_VALUE(cur);
++    size_t flags;
++
++    for (;;) {
++        spin_lock_irqsave(&rw->lock, flags);
++
++        if (rw->live_readers == 0 && rw->live_writers == 0) {
++            rw->live_writers = 1;
++            spin_unlock_irqrestore(&rw->lock, flags);
++            smp_mb();
++            return;
++        }
++
++        preempt_disable();
++        add_to_wait_queue(&rw->writers_q, &entry);
++        spin_unlock_irqrestore(&rw->lock, flags);
++
++        schedule();
++        preempt_enable();
++    }
++}
++
++void rwmutex_write_release(rwmutex_t *rw) {
++    size_t flags;
++    bool readers_waiting;
++
++    smp_mb();
++    spin_lock_irqsave(&rw->lock, flags);
++    if (rw->live_writers == 0)
++        panic("rwmutex: write_release underflow\n");
++    rw->live_writers = 0;
++    readers_waiting = (rw->waiting_readers > 0);
++    spin_unlock_irqrestore(&rw->lock, flags);
++
++    /* prefer readers: if any are parked, wake all of them. otherwise
++     * hand the lock off to a single writer. */
++    if (readers_waiting)
++        wait_queue_wake_all(&rw->readers_q);
++    else
++        wait_queue_wake_one(&rw->writers_q);
++}
+diff --git a/tests/rwmutex_tests.c b/tests/rwmutex_tests.c
+new file mode 100644
+index 0000000..a2f47e8
+--- /dev/null
++++ b/tests/rwmutex_tests.c
+@@ -0,0 +1,115 @@
++
++#include <kmalloc.h>
++#include <ktest.h>
++#include <kthread.h>
++#include <printk.h>
++#include <rwmutex.h>
++#include <sched.h>
++
++struct rwm_test_data {
++    rwmutex_t rw;
++    u8 writer_ran;
++    ktest_t *test;
++};
++
++/* single thread. acquire/release both sides, check counters. */
++static void rwmutex_test_case_1(ktest_t *test) {
++    rwmutex_t rw;
++
++    rwmutex_init(&rw);
++    ktest_log(test, "init ok. live_r=%d live_w=%d\n", rw.live_readers,
++              rw.live_writers);
++    KTEST_ASSERT_EQ(test, rw.live_readers, 0);
++    KTEST_ASSERT_EQ(test, rw.live_writers, 0);
++
++    /* reader side */
++    rwmutex_read_acquire(&rw);
++    ktest_log(test, "after read_acquire: live_r=%d\n", rw.live_readers);
++    KTEST_EXPECT_EQ(test, rw.live_readers, 1);
++    KTEST_EXPECT_EQ(test, rw.live_writers, 0);
++    rwmutex_read_release(&rw);
++    KTEST_EXPECT_EQ(test, rw.live_readers, 0);
++
++    /* writer side */
++    rwmutex_write_acquire(&rw);
++    ktest_log(test, "after write_acquire: live_w=%d\n", rw.live_writers);
++    KTEST_EXPECT_EQ(test, rw.live_writers, 1);
++    KTEST_EXPECT_EQ(test, rw.live_readers, 0);
++    rwmutex_write_release(&rw);
++    KTEST_EXPECT_EQ(test, rw.live_writers, 0);
++}
++
++/* case 2: two readers can hold at the same time. */
++static void rwmutex_test_case_2(ktest_t *test) {
++    rwmutex_t rw;
++    rwmutex_init(&rw);
++
++    rwmutex_read_acquire(&rw);
++    rwmutex_read_acquire(&rw);
++    ktest_log(test, "two readers in, live_r=%d\n", rw.live_readers);
++    KTEST_EXPECT_EQ(test, rw.live_readers, 2);
++    KTEST_EXPECT_EQ(test, rw.live_writers, 0);
++
++    rwmutex_read_release(&rw);
++    KTEST_EXPECT_EQ(test, rw.live_readers, 1);
++    rwmutex_read_release(&rw);
++    KTEST_EXPECT_EQ(test, rw.live_readers, 0);
++}
++
++/* case 3: writer blocks while a reader holds, then acquires on release. */
++static status_t rwmutex_writer_thread(void *arg) {
++    struct rwm_test_data *data = arg;
++    ktest_t *test = data->test;
++
++    ktest_log(test, "writer-thread: about to write_acquire (should block)\n");
++    data->writer_ran = 1;
++    rwmutex_write_acquire(&data->rw);
++    ktest_log(test, "writer-thread: got the write lock. live_w=%d\n",
++              data->rw.live_writers);
++    KTEST_EXPECT_EQ(test, data->rw.live_writers, 1);
++    KTEST_EXPECT_EQ(test, data->rw.live_readers, 0);
++    rwmutex_write_release(&data->rw);
++    ktest_log(test, "writer-thread: released\n");
++    kfree(data);
++    return 0;
++}
++
++static void rwmutex_test_case_3(ktest_t *test) {
++    struct rwm_test_data *data = kmalloc();
++
++    data->writer_ran = 0;
++    data->test = test;
++    rwmutex_init(&data->rw);
++
++    rwmutex_read_acquire(&data->rw);
++    ktest_log(test, "main: holding read lock, spawning writer\n");
++
++    kthread_create_info_t info = {"rwm_writer", &rwmutex_writer_thread,
++                                  KTHREAD_READY, data};
++    kthread_create(&info);
++
++    /* let writer run and block */
++    if (!data->writer_ran)
++        schedule();
++
++    KTEST_EXPECT_EQ(test, data->rw.live_readers, 1);
++    KTEST_EXPECT_EQ(test, data->rw.live_writers, 0);
++
++    ktest_log(test, "main: releasing read, writer should wake\n");
++    rwmutex_read_release(&data->rw);
++}
++
++ktest_case_t __used rwmutex_test_cases[] = {KTEST_CASE(rwmutex_test_case_1),
++                                            KTEST_CASE(rwmutex_test_case_2),
++                                            KTEST_CASE(rwmutex_test_case_3),
++                                            {NULL}};
++
++static spin_lock_t rwmutex_test_lock;
++
++ktest_suite_t __used rwmutex_test_suite = {
++    .name = "rwmutex_test_suite",
++    .test_cases = rwmutex_test_cases,
++    .lock = &rwmutex_test_lock,
++};
++
++KTEST_SUITE_EXPORT(rwmutex_test_suite)
+diff --git a/tests/tests.mk b/tests/tests.mk
+index 689ea4c..22d6278 100644
+--- a/tests/tests.mk
++++ b/tests/tests.mk
+@@ -3,6 +3,7 @@ $(call add_src, $(CONFIG_KTEST), TESTS_OBJS, one_test_case_example.o)
+ $(call add_src, $(CONFIG_KTEST), TESTS_OBJS, two_test_cases_example.o)
+ $(call add_src, $(CONFIG_KTEST), TESTS_OBJS, kthread_tests.o)
+ $(call add_src, $(CONFIG_KTEST), TESTS_OBJS, mutex_tests.o)
++$(call add_src, $(CONFIG_KTEST), TESTS_OBJS, rwmutex_tests.o)
+ $(call add_src, $(CONFIG_SMP_KTESTS), TESTS_OBJS, mutex_pi_tests.o)
+ $(call add_src, $(CONFIG_KTEST), TESTS_OBJS, kmalloc_tests.o)
+ $(call add_src, $(CONFIG_KTEST), TESTS_OBJS, atomic_tests.o)
+@@ -26,6 +27,7 @@ $(call add_src, $(CONFIG_TIMER_KTEST), TESTS_OBJS, timer_test.o)
+ $(call add_src, $(CONFIG_TIMER_STRESS_KTEST), TESTS_OBJS, timer_test2.o)
+ $(call add_src, $(CONFIG_SMP_KTESTS), TESTS_OBJS, smp_spinlock_tests.o)
+ $(call add_src, $(CONFIG_SMP_KTESTS), TESTS_OBJS, smp_mutex_tests.o)
++$(call add_src, $(CONFIG_SMP_KTESTS), TESTS_OBJS, smp_rwmutex_tests.o)
+ $(call add_src, $(CONFIG_SMP_KTESTS), TESTS_OBJS, smp_atomics_tests.o)
+ $(call add_src, $(CONFIG_SMP_KTESTS), TESTS_OBJS, smp_ipi_tests.o)
+ $(call add_src, $(CONFIG_SMP_KTESTS), TESTS_OBJS, smp_async_work_tests.o)
+-- 
+2.43.0
+
